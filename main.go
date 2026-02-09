@@ -1,262 +1,427 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 )
 
-// --- NEUES EXE DESIGN (Konsolen-basiert) ---
-// Wir nutzen ANSI-Farbcodes und ASCII-Art für den Look.
+// --- DATENBANK STRUKTUREN ---
+type ScanResult struct {
+	ID        string
+	Time      string
+	Username  string
+	SteamID   string // Simuliert
+	RiskLevel string // "Clean", "Suspicious", "Detected"
+	Detections []string
+}
+
+type CustomRule struct {
+	Name      string
+	Type      string // "String", "Hash", "File"
+	Value     string
+}
+
+// Einfacher In-Memory Speicher (Speichert Daten solange der Server läuft)
+var (
+	GlobalStrings   = []string{"vape", "killaura", "autoclicker"}
+	GlobalRules     = []CustomRule{}
+	GlobalScans     = []ScanResult{}
+	DataMutex       sync.Mutex // Damit beim gleichzeitigen Schreiben nichts abstürzt
+)
+
+// --- DER SCANNER CODE (Wird in die EXE kompiliert) ---
 const scannerCode = `
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/user"
 	"strings"
 	"time"
+	"net/http"
 )
 
-// Farbcodes für die Konsole
+// Konfig
+var ServerURL string = "ERSETZE_MICH" // Wird beim Bauen überschrieben
+var BuildStrings string 
+
+// Design Konstanten
 const (
-	ColorReset  = "\033[0m"
 	ColorRed    = "\033[31m"
+	ColorGreen  = "\033[32m"
 	ColorWhite  = "\033[97m"
 	ColorGray   = "\033[90m"
-	bgBlack     = "\033[40m"
+	Reset       = "\033[0m"
 )
 
-var Detections string
+type ReportPayload struct {
+	Username   string   ` + "`json:\"username\"`" + `
+	Detections []string ` + "`json:\"detections\"`" + `
+}
 
 func main() {
-	// Konsole "säubern" und Header anzeigen
+	// 1. UI Initialisierung
 	fmt.Print("\033[H\033[2J") // Clear Screen
-	fmt.Println(bgBlack + ColorRed + ` + "`" + `
+	fmt.Println(ColorRed + ` + "`" + `
 ██████╗ ███████╗██████╗ ███████╗ ██████╗ ███╗   ██╗███████╗
 ██╔══██╗██╔════╝██╔══██╗╚══███╔╝██╔═══██╗████╗  ██║██╔════╝
 ██████╔╝█████╗  ██║  ██║  ███╔╝ ██║   ██║██╔██╗ ██║█████╗  
 ██╔══██╗██╔════╝██║  ██║ ███╔╝  ██║   ██║██║╚██╗██║██╔════╝
 ██║  ██║███████╗██████╔╝███████╗╚██████╔╝██║ ╚████║███████╗
 ╚═╝  ╚═╝╚══════╝╚═════╝ ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
-` + "`" + ` + ColorReset)
-	fmt.Println(ColorGray + "---------------------------------------------------------" + ColorReset)
-	fmt.Println(ColorWhite + "                SYSTEM SCAN INITIATED" + ColorReset)
-	fmt.Println(ColorGray + "---------------------------------------------------------" + ColorReset)
-	fmt.Println("")
+` + "`" + ` + Reset)
+	
+	fmt.Println(ColorGray + "\nConnecting to REDZONE Cloud..." + Reset)
+	time.Sleep(1 * time.Second)
 
-	searchList := strings.Split(Detections, ",")
-	if len(Detections) == 0 {
-		fmt.Println(ColorRed + "[!] ERROR: No detection strings loaded." + ColorReset)
-		time.Sleep(5 * time.Second)
-		return
+	currentUser, _ := user.Current()
+	username := "Unknown"
+	if currentUser != nil {
+		username = currentUser.Username
 	}
 
-	fmt.Printf(ColorGray+"Loaded Signatures: "+ColorWhite+"%d\n"+ColorReset, len(searchList))
-	fmt.Println(ColorGray + "Scanning current directory..." + ColorReset)
-	fmt.Println("")
+	fmt.Printf("Scanning Target: " + ColorWhite + "%s\n" + Reset, username)
+	fmt.Println(ColorGray + "--------------------------------------------------" + Reset)
 
-	files, err := os.ReadDir("./")
-	if err != nil {
-		fmt.Println(ColorRed + "[!] Error reading directory." + ColorReset)
-		return
-	}
+	// 2. Der Scan (Simuliert anhand der Strings)
+	targetStrings := strings.Split(BuildStrings, ",")
+	foundThreats := []string{}
 
-	foundCount := 0
-	for _, file := range files {
-		for _, detect := range searchList {
-			if detect != "" && strings.Contains(strings.ToLower(file.Name()), strings.ToLower(detect)) {
-				fmt.Printf(" "+ColorRed+"[DETECTED] "+ColorWhite+"%s "+ColorGray+"(Signature: %s)\n"+ColorReset, file.Name(), detect)
-				foundCount++
-				break // Ein Treffer pro Datei reicht
+	// Echter Dateiscan (Hier vereinfacht auf lokalen Ordner für Demo)
+	files, _ := os.ReadDir("./")
+	for _, f := range files {
+		for _, s := range targetStrings {
+			if s != "" && strings.Contains(strings.ToLower(f.Name()), strings.ToLower(s)) {
+				fmt.Printf(ColorRed + "[!] DETECTED: " + ColorWhite + "%s " + ColorGray + "(Sig: %s)\n" + Reset, f.Name(), s)
+				foundThreats = append(foundThreats, f.Name() + " (" + s + ")")
 			}
 		}
 	}
 
-	fmt.Println("")
-	fmt.Println(ColorGray + "---------------------------------------------------------" + ColorReset)
-	if foundCount == 0 {
-		fmt.Println("            " + ColorWhite + "STATUS: " + ColorRed + "CLEAN" + ColorReset)
-	} else {
-		fmt.Printf("            "+ColorWhite+"STATUS: "+ColorRed+"THREATS FOUND (%d)\n"+ColorReset, foundCount)
+	// 3. Ergebnis Senden
+	fmt.Println(ColorGray + "\nUploading results to dashboard..." + Reset)
+	
+	payload := ReportPayload{
+		Username:   username,
+		Detections: foundThreats,
 	}
-	fmt.Println(ColorGray + "---------------------------------------------------------" + ColorReset)
+	jsonData, _ := json.Marshal(payload)
 
-	fmt.Println(ColorGray + "\nClosing in 10 seconds..." + ColorReset)
-	time.Sleep(10 * time.Second)
+	// Sende POST Request an deine Website
+	_, err := http.Post(ServerURL + "/api/report", "application/json", bytes.NewBuffer(jsonData))
+	
+	fmt.Println(ColorGray + "--------------------------------------------------" + Reset)
+	if err != nil {
+		fmt.Println(ColorRed + "Upload Failed. Server offline?" + Reset)
+	} else {
+		fmt.Println(ColorGreen + "UPLOAD SUCCESSFUL." + Reset)
+		fmt.Println("Check the 'Scans' tab on the website.")
+	}
+	
+	if len(foundThreats) > 0 {
+		fmt.Println("\n" + ColorRed + "RESULT: FAILED (Threats Found)" + Reset)
+	} else {
+		fmt.Println("\n" + ColorGreen + "RESULT: CLEAN" + Reset)
+	}
+
+	fmt.Println("\nPress ENTER to exit.")
+	fmt.Scanln()
 }
 `
 
-func main() {
-	ioutil.WriteFile("scanner_template.go", []byte(scannerCode), 0644)
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// --- NEUES WEBSITE DESIGN (HTML + Tailwind CSS) ---
-		// Wir definieren die Farben direkt in der Config, um sie überall zu nutzen.
-		// bg-zinc-950 = Fast Schwarz (Hintergrund)
-		// bg-zinc-900 = Sehr dunkles Grau (Sidebar/Karten)
-		// red-600 = Unser Akzent-Rot
-		html := `
+// --- HTML TEMPLATE (Frontend) ---
+const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="de" class="h-full bg-zinc-950">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>REDZONE - Panel</title>
+    <title>REDZONE | Echo Clone</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        zinc: { 900: '#18181b', 950: '#09090b' },
-                        red: { 600: '#dc2626', 700: '#b91c1c' }
-                    }
-                }
-            }
+            theme: { extend: { colors: { zinc: { 900: '#18181b', 950: '#09090b' }, red: { 600: '#dc2626' } } } }
         }
     </script>
     <style>
-        /* Verstecke Scrollbars für cleaneren Look */
+        .active-tab { background-color: rgba(220, 38, 38, 0.1); color: #dc2626; border-right: 2px solid #dc2626; }
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: #09090b; }
-        ::-webkit-scrollbar-thumb { background: #dc2626; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
     </style>
 </head>
-<body class="h-full flex font-sans text-zinc-300">
+<body class="h-full flex font-sans text-zinc-400 overflow-hidden">
 
-    <div class="w-64 bg-zinc-900 flex flex-col border-r border-zinc-800">
+    <div class="w-64 bg-zinc-900 flex flex-col border-r border-zinc-800 flex-shrink-0">
         <div class="h-16 flex items-center px-6 border-b border-zinc-800">
-            <h1 class="text-2xl font-black tracking-wider text-red-600">REDZONE</h1>
+            <h1 class="text-2xl font-black italic tracking-widest text-white">RED<span class="text-red-600">ZONE</span></h1>
         </div>
-        <nav class="flex-1 py-6 px-4 space-y-2 overflow-y-auto">
-            <a href="#" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg bg-red-600/10 text-red-600">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" /></svg>
-                String Ersteller
-            </a>
-            <a href="#" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg hover:bg-zinc-800 transition-colors">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-3 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                Benutzerdefinierte Erk.
-            </a>
-            </nav>
+        
+        <nav class="flex-1 py-6 space-y-1">
+            <button onclick="showTab('scans')" id="btn-scans" class="w-full flex items-center px-6 py-3 hover:bg-zinc-800 transition text-left active-tab">
+                <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+                Scans
+            </button>
+            <button onclick="showTab('strings')" id="btn-strings" class="w-full flex items-center px-6 py-3 hover:bg-zinc-800 transition text-left">
+                <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>
+                String Builder
+            </button>
+            <button onclick="showTab('custom')" id="btn-custom" class="w-full flex items-center px-6 py-3 hover:bg-zinc-800 transition text-left">
+                <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.384-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/></svg>
+                Custom Detections
+            </button>
+        </nav>
+
         <div class="p-4 border-t border-zinc-800">
-            <div class="flex items-center">
-                 <div class="w-8 h-8 rounded-full bg-red-600 flex items-center justify-center font-bold text-white">A</div>
-                 <div class="ml-3">
-                     <p class="text-sm font-medium text-white">Admin</p>
-                     <p class="text-xs text-zinc-500">Administrator</p>
-                 </div>
-            </div>
+            <form action="/download" method="POST">
+                <button class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded shadow-lg shadow-red-900/20 transition">
+                    DOWNLOAD EXE
+                </button>
+            </form>
         </div>
     </div>
 
-    <div class="flex-1 flex flex-col overflow-hidden">
-        <header class="h-16 bg-zinc-900 border-b border-zinc-800 flex items-center justify-between px-8">
-            <h2 class="text-lg font-semibold text-white">String Builder</h2>
-        </header>
-
-        <main class="flex-1 overflow-y-auto p-8">
+    <div class="flex-1 overflow-y-auto bg-zinc-950 p-8 relative">
+        
+        <div id="tab-scans" class="space-y-6">
+            <h2 class="text-xl font-bold text-white mb-4">Neueste Scans</h2>
             
-            <div class="mb-12">
-                <div class="flex justify-between items-center mb-6">
-                    <div>
-                         <span class="inline-block px-4 py-2 text-sm font-medium rounded-l-lg bg-red-600 text-white cursor-pointer">Your Custom Strings</span>
-                         <span class="inline-block px-4 py-2 text-sm font-medium rounded-r-lg bg-zinc-800 text-zinc-400 cursor-not-allowed">Enterprise Strings</span>
-                    </div>
-                </div>
+            <div class="overflow-hidden rounded-lg border border-zinc-800">
+                <table class="min-w-full bg-zinc-900">
+                    <thead>
+                        <tr class="border-b border-zinc-800">
+                            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">User</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Ergebnis</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Detections</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Zeit</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-zinc-800 text-zinc-300">
+                        {{range .Scans}}
+                        <tr class="hover:bg-zinc-800/50 transition">
+                            <td class="px-6 py-4 whitespace-nowrap flex items-center">
+                                <div class="h-8 w-8 rounded bg-zinc-700 flex items-center justify-center text-white font-bold mr-3">{{slice .Username 0 1}}</div>
+                                {{.Username}}
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                {{if eq .RiskLevel "Clean"}}
+                                    <span class="px-2 py-1 text-xs rounded bg-green-900/30 text-green-500 border border-green-900">Clean</span>
+                                {{else}}
+                                    <span class="px-2 py-1 text-xs rounded bg-red-900/30 text-red-500 border border-red-900">DETECTED</span>
+                                {{end}}
+                            </td>
+                            <td class="px-6 py-4">
+                                {{if .Detections}}
+                                    <span class="text-red-400 text-sm font-mono">{{.Detections}}</span>
+                                {{else}}
+                                    <span class="text-zinc-600 text-sm">-</span>
+                                {{end}}
+                            </td>
+                            <td class="px-6 py-4 text-sm text-zinc-500">{{.Time}}</td>
+                        </tr>
+                        {{else}}
+                        <tr>
+                            <td colspan="4" class="px-6 py-12 text-center text-zinc-600">Noch keine Scans vorhanden. Starte die EXE!</td>
+                        </tr>
+                        {{end}}
+                    </tbody>
+                </table>
+            </div>
+        </div>
 
-                <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-8 flex flex-col items-center justify-center min-h-[400px]">
-                    <div class="text-center max-w-md">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16 mx-auto text-zinc-700 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                        </svg>
-                        <h3 class="text-xl font-bold text-white mb-2">Erstelle deine erste Detection</h3>
-                        <p class="text-zinc-500 mb-8">Füge Strings hinzu, nach denen der Scanner suchen soll. Die EXE wird live generiert.</p>
-                        
-                        <form action="/download" method="POST" class="flex gap-2">
-                            <input type="text" name="strings" placeholder="z.B. vape,reach,autoclicker.exe" class="flex-1 bg-zinc-950 border border-zinc-700 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-red-600 transition-colors">
-                            <button type="submit" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition-colors flex items-center">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" /></svg>
-                                EXE Generieren
-                            </button>
-                        </form>
+        <div id="tab-strings" class="hidden space-y-6">
+            <h2 class="text-xl font-bold text-white mb-4">String Manager</h2>
+            <div class="bg-zinc-900 p-6 rounded-lg border border-zinc-800">
+                <form action="/add_string" method="POST" class="flex gap-4">
+                    <input type="text" name="new_string" placeholder="Cheat String eingeben (z.B. vape_v4)" class="flex-1 bg-zinc-950 border border-zinc-700 rounded px-4 py-2 text-white focus:border-red-600 focus:outline-none">
+                    <button class="bg-zinc-800 hover:bg-zinc-700 text-white px-6 py-2 rounded border border-zinc-700">+ Hinzufügen</button>
+                </form>
+                
+                <div class="mt-8">
+                    <h3 class="text-sm font-semibold text-zinc-500 uppercase mb-4">Aktive Strings</h3>
+                    <div class="flex flex-wrap gap-2">
+                        {{range .Strings}}
+                        <div class="bg-zinc-950 border border-zinc-700 px-3 py-1 rounded text-sm text-zinc-300 flex items-center">
+                            {{.}}
+                        </div>
+                        {{end}}
                     </div>
                 </div>
             </div>
+        </div>
 
-            <div>
-                 <h3 class="text-lg font-semibold text-white mb-4 flex items-center">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                    Deine Detections (Vorschau)
-                 </h3>
-                 <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <div class="bg-zinc-900/50 rounded-xl border-2 border-dashed border-zinc-700 hover:border-red-600 flex items-center justify-center h-48 cursor-pointer transition-colors group">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-zinc-700 group-hover:text-red-600 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
-                    </div>
-                    <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden hover:border-red-600/50 transition-colors">
-                        <div class="h-32 bg-zinc-950 flex items-center justify-center relative overflow-hidden">
-                             <div class="absolute inset-0 bg-gradient-to-br from-red-600/20 to-transparent opacity-50"></div>
-                             <h4 class="text-xl font-bold text-white relative z-10">MINECRAFT KILLAURA</h4>
-                        </div>
-                        <div class="p-4 flex justify-between items-center bg-zinc-900">
-                            <div class="flex space-x-2">
-                                <span class="text-xs px-2 py-1 bg-red-600/10 text-red-600 rounded-md">Memory</span>
-                                <span class="text-xs px-2 py-1 bg-zinc-800 text-zinc-400 rounded-md">V1.2</span>
-                            </div>
-                             <div class="flex space-x-3 text-zinc-500">
-                                 <button class="hover:text-red-600"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg></button>
-                                 <button class="hover:text-red-600"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
-                             </div>
-                        </div>
-                    </div>
-                 </div>
+        <div id="tab-custom" class="hidden space-y-6">
+             <div class="flex justify-between items-center">
+                <h2 class="text-xl font-bold text-white">Advanced Detections</h2>
+                <button class="bg-red-600 text-white px-4 py-2 rounded text-sm hover:bg-red-700">+ Create New</button>
              </div>
 
-        </main>
+             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden group hover:border-red-600/50 transition">
+                    <div class="h-32 bg-zinc-950 relative flex items-center justify-center">
+                        <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')] opacity-20"></div>
+                        <h3 class="text-xl font-bold text-white relative z-10">SSTB</h3>
+                    </div>
+                    <div class="p-4">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="text-xs font-mono text-zinc-500">HASH SCAN</span>
+                            <div class="flex space-x-2">
+                                <div class="w-2 h-2 rounded-full bg-green-500"></div>
+                                <span class="text-xs text-green-500">Active</span>
+                            </div>
+                        </div>
+                        <div class="bg-zinc-950 p-3 rounded border border-zinc-800 font-mono text-xs text-zinc-400 overflow-hidden whitespace-nowrap">
+                            md5: 4d833a1388...
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden group hover:border-red-600/50 transition">
+                    <div class="h-32 bg-zinc-950 relative flex items-center justify-center">
+                         <div class="absolute inset-0 bg-red-900/10"></div>
+                        <h3 class="text-xl font-bold text-white relative z-10">XRC BYPASS</h3>
+                    </div>
+                    <div class="p-4">
+                         <div class="flex items-center justify-between mb-4">
+                            <span class="text-xs font-mono text-zinc-500">MEMORY SCAN</span>
+                             <div class="flex space-x-2">
+                                <div class="w-2 h-2 rounded-full bg-green-500"></div>
+                                <span class="text-xs text-green-500">Active</span>
+                            </div>
+                        </div>
+                        <div class="bg-zinc-950 p-3 rounded border border-zinc-800 font-mono text-xs text-zinc-400">
+                            Strings: xrc_main, hook_v2
+                        </div>
+                    </div>
+                </div>
+             </div>
+        </div>
+
     </div>
+
+    <script>
+        function showTab(name) {
+            ['scans', 'strings', 'custom'].forEach(t => {
+                document.getElementById('tab-' + t).classList.add('hidden');
+                document.getElementById('btn-' + t).classList.remove('active-tab');
+            });
+            document.getElementById('tab-' + name).classList.remove('hidden');
+            document.getElementById('btn-' + name).classList.add('active-tab');
+        }
+    </script>
 </body>
 </html>
 `
-		fmt.Fprint(w, html)
+
+// --- SERVER LOGIK ---
+
+func main() {
+	// Erstelle das Scanner Template initial
+	ioutil.WriteFile("scanner_template.go", []byte(scannerCode), 0644)
+
+	// ROUTE: Dashboard (Hauptseite)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		DataMutex.Lock()
+		data := struct {
+			Strings []string
+			Scans   []ScanResult
+		}{
+			Strings: GlobalStrings,
+			Scans:   GlobalScans, // Wir zeigen die Liste umgekehrt (neueste oben) könnte man noch machen
+		}
+		DataMutex.Unlock()
+
+		tmpl, _ := template.New("index").Parse(htmlTemplate)
+		tmpl.Execute(w, data)
 	})
 
+	// ROUTE: String hinzufügen
+	http.HandleFunc("/add_string", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			newStr := r.FormValue("new_string")
+			if newStr != "" {
+				DataMutex.Lock()
+				GlobalStrings = append(GlobalStrings, newStr)
+				DataMutex.Unlock()
+			}
+		}
+		http.Redirect(w, r, "/", 303)
+	})
+
+	// ROUTE: API für die EXE (Report empfangen)
+	http.HandleFunc("/api/report", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" { return }
+
+		var payload struct {
+			Username   string   `json:"username"`
+			Detections []string `json:"detections"`
+		}
+
+		json.NewDecoder(r.Body).Decode(&payload)
+
+		result := ScanResult{
+			ID:        fmt.Sprintf("%d", time.Now().Unix()),
+			Time:      time.Now().Format("15:04:05"),
+			Username:  payload.Username,
+			RiskLevel: "Clean",
+			Detections: payload.Detections,
+		}
+
+		if len(payload.Detections) > 0 {
+			result.RiskLevel = "DETECTED"
+		}
+
+		DataMutex.Lock()
+		// Füge neuen Scan vorne an (damit er oben in der Liste ist)
+		GlobalScans = append([]ScanResult{result}, GlobalScans...)
+		DataMutex.Unlock()
+
+		fmt.Printf("[SERVER] Neuer Report von %s erhalten. Detections: %d\n", payload.Username, len(payload.Detections))
+	})
+
+	// ROUTE: EXE Downloaden
 	http.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Redirect(w, r, "/", 303)
-			return
+		// Ermittle die URL der aktuellen Website (für den Client)
+		// Bei Render.com nutzen wir die Environment Variable, lokal localhost
+		host := "https://" + r.Host
+		if strings.Contains(r.Host, "localhost") {
+			host = "http://" + r.Host
 		}
 
-		detects := r.FormValue("strings")
-		// Verhindere leere Strings, die alles matchen würden
-		if strings.TrimSpace(detects) == "" {
-			http.Error(w, "Fehler: Bitte gib mindestens einen String ein.", 400)
-			return
-		}
+		DataMutex.Lock()
+		currentStrings := strings.Join(GlobalStrings, ",")
+		DataMutex.Unlock()
 
-		// Wir bauen die Windows EXE und injecten die Strings
-		cmd := exec.Command("go", "build", "-ldflags", "-X main.Detections="+detects, "-o", "redzone_scanner.exe", "scanner_template.go")
+		// Compiler Befehl: Wir brennen die URL und die Strings in die EXE ein
+		// WICHTIG: -X main.ServerURL=... sorgt dafür, dass die EXE weiß, wo sie hinmelden muss
+		cmd := exec.Command("go", "build", 
+			"-ldflags", fmt.Sprintf("-X main.ServerURL=%s -X main.BuildStrings=%s", host, currentStrings), 
+			"-o", "redzone_client.exe", "scanner_template.go")
+		
 		cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64")
-
 		output, err := cmd.CombinedOutput()
+
 		if err != nil {
-			// Zeige Build-Fehler im Browser an (hilfreich fürs Debugging)
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(500)
-			fmt.Fprintf(w, "Build Error:\n%s", output)
+			http.Error(w, "Build Error: "+string(output), 500)
 			return
 		}
 
-		w.Header().Set("Content-Disposition", "attachment; filename=redzone_scanner.exe")
-		http.ServeFile(w, r, "redzone_scanner.exe")
+		w.Header().Set("Content-Disposition", "attachment; filename=redzone_client.exe")
+		http.ServeFile(w, r, "redzone_client.exe")
 	})
 
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	fmt.Println("REDZONE Server startet auf Port " + port)
+	if port == "" { port = "8080" }
+	fmt.Println("REDZONE C2 Server läuft auf Port " + port)
 	http.ListenAndServe(":"+port, nil)
 }
